@@ -1,0 +1,418 @@
+# --- CREDIT RISK PREDICTOR V26.0 (VERSION FINAL DE PRODUCCIÓN PDF) ---
+# [Este script está optimizado para generar un PDF profesional y robusto]
+
+import os
+import joblib
+import warnings
+from pathlib import Path
+from typing import Dict
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+from datetime import datetime
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, accuracy_score
+
+from fpdf import FPDF
+from fpdf.enums import Align
+
+warnings.filterwarnings("ignore")
+sns.set(style="whitegrid", rc={"figure.dpi": 110})
+
+# =========================================================================
+# CONFIGURACIÓN Y RUTAS GLOBALES
+# =========================================================================
+DATA_PATH = Path(r"C:\Users\spaulin\Desktop\Credit Risk analysis\loan_default.csv")
+MODEL_DIR = Path("./models")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_FILE = MODEL_DIR / "credit_rf_calibrated.joblib"
+META_FILE = MODEL_DIR / "preproc_meta.joblib"
+TARGET_COL = "Default"
+
+# =========================================================================
+# 1. FUNCIONES AUXILIARES (Lectura, Amortización, Plots)
+# =========================================================================
+
+def read_data(path: Path) -> pd.DataFrame:
+    """Lectura robusta del CSV con autodetección de separador."""
+    if not path.exists():
+        raise FileNotFoundError(f"❌ ERROR: No se encontró el archivo: {path}")
+
+    for sep_char in [",", ";"]:
+        try:
+            df = pd.read_csv(path, sep=sep_char)
+            if df.shape[1] > 1:
+                print(f"✔ CSV leído correctamente con separador '{sep_char}'")
+                df.columns = df.columns.str.strip() 
+                return df
+        except:
+            continue
+    raise ValueError("❌ ERROR: El CSV se está importando como 1 sola columna. Verifique el delimitador.")
+
+def calculate_amortization(principal: float, rate_yearly_pct: float, term_months: int) -> pd.DataFrame:
+    """Calcula el pago mensual y genera la tabla de amortización."""
+    rate_monthly = rate_yearly_pct / 1200
+    monthly_payment = principal / term_months if rate_monthly == 0 else principal * (
+        rate_monthly * (1 + rate_monthly) ** term_months) / ((1 + rate_monthly) ** term_months - 1)
+    schedule = []
+    balance = principal
+    for month in range(1, term_months + 1):
+        interest_paid = balance * rate_monthly
+        principal_paid = monthly_payment - interest_paid
+        balance -= principal_paid
+        schedule.append({'Mes': month, 'Pago Mensual': monthly_payment, 'Interes Pagado': interest_paid, 'Capital Pagado': principal_paid, 'Saldo Capital': max(0, balance)})
+    return pd.DataFrame(schedule)
+
+# Funciones de Plotting (solo generan figuras, no guardan ni muestran)
+def plot_prediction_bar(prob: float):
+    # (Lógica de plotting)
+    prob_pago = 1 - prob
+    prob_impago = prob
+    data = pd.DataFrame({'Estado': ['Pago', 'Impago'], 'Probabilidad': [prob_pago, prob_impago]})
+    colors = ['#4CAF50', '#F44336']
+    plt.figure(figsize=(7, 3.5))
+    ax = sns.barplot(x='Probabilidad', y='Estado', data=data, palette=colors, orient='h')
+    for idx, row in data.iterrows():
+        ax.text(row.Probabilidad, idx, f'{row.Probabilidad*100:.2f}%', color='black', ha='left', va='center', fontsize=12)
+    plt.xlim(0,1)
+    plt.title("Probabilidad de Pago vs Impago", fontsize=14)
+    plt.tight_layout()
+
+def plot_amortization(schedule: pd.DataFrame, loan_amount, term_months: int):
+    # (Lógica de plotting)
+    schedule['Año'] = np.ceil(schedule['Mes']/12).astype(int)
+    annual_summary = schedule.groupby('Año').agg({'Capital Pagado':'sum','Interes Pagado':'sum'}).reset_index()
+    plt.figure(figsize=(8,4))
+    plt.bar(annual_summary['Año'], annual_summary['Capital Pagado'], label='Capital Pagado', color='#0284c7')
+    plt.bar(annual_summary['Año'], annual_summary['Interes Pagado'], bottom=annual_summary['Capital Pagado'], label='Interés Pagado', color='#f59e0b')
+    plt.title(f"Amortización Anual del Préstamo (${loan_amount:,.0f})", fontsize=14)
+    plt.xlabel(f"Año (Plazo: {term_months//12} años {term_months%12} meses)")
+    plt.ylabel("Monto Acumulado")
+    plt.xticks(annual_summary['Año'])
+    plt.legend(loc='upper left')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+
+def plot_loan_income_percent(schedule: pd.DataFrame, monthly_income: float):
+    # (Lógica de plotting)
+    monthly_payment = schedule['Pago Mensual'].iloc[0] if not schedule.empty else 0
+    percent = monthly_payment / monthly_income * 100 if monthly_income else 100
+    plt.figure(figsize=(6,3))
+    plt.bar(['% Pago/Ingreso'], [percent], color='#4CAF50')
+    plt.axhline(y=35, color='#F44336', linestyle='--', label='Límite recomendado (35%)')
+    plt.ylim(0, max(percent+5,40))
+    plt.text(0, percent, f'{percent:.2f}%', ha='center', va='bottom', fontsize=12, fontweight='bold')
+    plt.title("Impacto mensual en el ingreso", fontsize=14)
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+
+def get_feature_justification(pipe: Pipeline):
+    """Extrae la importancia de las características del modelo entrenado."""
+    try:
+        meta_data = joblib.load(META_FILE)
+        feature_names_out = meta_data['feature_names']
+        
+        # El error de "Not Fitted" se captura si el modelo no fue entrenado correctamente.
+        rf_model = pipe['clf'].estimator
+        if not hasattr(rf_model, 'feature_importances_'):
+             raise AttributeError("Modelo base no inicializado correctamente.")
+             
+        importance_df = pd.DataFrame({'Característica': feature_names_out, 'Importancia': rf_model.feature_importances_})
+        
+        importance_df['Característica'] = importance_df['Característica'].str.replace('num__', '').str.replace('cat__', '').str.replace('_', ' ')
+        
+        return importance_df.sort_values('Importancia', ascending=False).head(5)
+    except Exception as e:
+        print(f"❌ Error al generar justificación: {e}")
+        # Retornar una tabla de error limpia
+        return pd.DataFrame({'Característica':['Error: Reentrenar el Modelo'], 'Importancia':[0]})
+
+def ask_user_inputs() -> Dict:
+    """Interfaz guiada para la inserción de datos del solicitante (en español)."""
+    print("\n=== Ingreso de datos del solicitante (VERSION V26.0) ===")
+
+    datos = {}
+    try:
+        datos["Age"] = int(input("1. Edad del solicitante: "))
+        datos["Income"] = float(input("2. Ingresos ANUALES: "))
+        datos["LoanAmount"] = float(input("3. Monto del préstamo solicitado: "))
+        datos["CreditScore"] = float(input("4. Puntaje crediticio (0 - 850): "))
+        datos["MonthsEmployed"] = int(input("5. Meses de empleo actual: "))
+        datos["NumCreditLines"] = int(input("6. Cantidad de líneas de crédito vigentes: "))
+        datos["InterestRate"] = float(input("7. Tasa de interés del préstamo (%): "))
+        datos["LoanTerm"] = int(input("8. Plazo del préstamo (en meses): "))
+        datos["DTIRatio"] = float(input("9. Relación deuda/ingreso (ej: 0.35): "))
+
+        datos["Education"] = input("10. Nivel educativo (ej: Bachelor's): ").strip()
+        datos["EmploymentType"] = input("11. Tipo de empleo (ej: Full-time): ").strip()
+        datos["MaritalStatus"] = input("12. Estado civil (ej: Single/Married): ").strip()
+
+        si_no_map = lambda x: 'Yes' if x.lower() in ["sí", "si", "yes", "y"] else 'No'
+        datos["HasMortgage"] = si_no_map(input("13. ¿Tiene hipoteca? (sí/no): "))
+        datos["HasDependents"] = si_no_map(input("14. ¿Tiene dependientes? (sí/no): "))
+        datos["LoanPurpose"] = input("15. Motivo del préstamo (ej: Auto/Home): ").strip()
+        datos["HasCoSigner"] = si_no_map(input("16. ¿Tiene co-firmante? (sí/no): "))
+        
+        datos["LoanID"] = "NUEVO_CLIENTE"
+        
+        return datos
+    except ValueError:
+        print("❌ Error: Por favor, introduce solo números para los campos numéricos.")
+        return None
+
+
+# =========================================================================
+# 2. FUNCIONES PRINCIPALES DE ML Y REPORTE
+# =========================================================================
+
+def build_preprocessor(X: pd.DataFrame):
+    """Define el ColumnTransformer, integra la Feature Engineering (StabilityScore)."""
+    X['StabilityScore'] = X['CreditScore'] * (X['MonthsEmployed'] + 1)
+    num_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    for col in ["LoanID", TARGET_COL]:
+        if col in num_cols: num_cols.remove(col)
+        if col in cat_cols: cat_cols.remove(col)
+    preprocessor = ColumnTransformer([
+        ("num", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), num_cols),
+        ("cat", Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="missing")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]), cat_cols)
+    ])
+    return preprocessor, num_cols, cat_cols
+
+def train_pipeline(df: pd.DataFrame):
+    """Entrena el modelo, realiza la validación y guarda el pipeline y metadatos."""
+    print("✔ Entrenando modelo...")
+    y = df[TARGET_COL].astype(int)
+    X = df.drop(columns=[TARGET_COL])
+    preproc, num_cols, cat_cols = build_preprocessor(X)
+    rf = RandomForestClassifier(n_estimators=250, max_depth=12, random_state=42, n_jobs=-1, class_weight="balanced")
+    model = CalibratedClassifierCV(rf, cv=3, method="isotonic")
+    pipe = Pipeline([("preproc", preproc), ("clf", model)])
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    pipe.fit(X_train, y_train)
+    feature_names = pipe['preproc'].get_feature_names_out()
+    joblib.dump(pipe, MODEL_FILE)
+    joblib.dump({"feature_names": feature_names}, META_FILE)
+    print(f"✔ Modelo guardado en {MODEL_FILE}")
+    return pipe
+
+def predict_single(sample: Dict, pipe: Pipeline):
+    """Realiza la predicción, obtiene el Score de probabilidad y la justificación."""
+    df_input = pd.DataFrame([sample]).fillna('missing')
+    df_input['StabilityScore'] = df_input['CreditScore']*(df_input['MonthsEmployed']+1)
+    prob = pipe.predict_proba(df_input)[0][1]
+    pred = pipe.predict(df_input)[0]
+    top_5_features = get_feature_justification(pipe)
+    return prob, pred, top_5_features
+
+def generar_pdf_detallado(datos_usuario, prob, riesgo, schedule, top_5_features):
+    """Genera un reporte PDF estilizado y detallado para el analista."""
+    
+    # --- Configuración Inicial y Colores ---
+    pdf = FPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    
+    COLOR_RISK_HIGH = (244, 67, 54) 
+    COLOR_RISK_LOW = (76, 175, 80)
+    COLOR_HEADER = (50, 50, 50)
+    COLOR_BG = (240, 240, 240)
+    
+    # 1. VARIOS CÁLCULOS
+    ingreso_mensual = datos_usuario.get('Income', 0) / 12
+    monthly_payment = schedule['Pago Mensual'].iloc[0] if not schedule.empty else 0
+    plazo_total = f"{datos_usuario['LoanTerm'] // 12} años y {datos_usuario['LoanTerm'] % 12} meses"
+    pago_vs_ingreso = (monthly_payment / ingreso_mensual) * 100 if ingreso_mensual else 100
+    total_interes = schedule['Interes Pagado'].sum()
+    
+    is_high_risk = prob > 0.35 # Usamos 35% como umbral de alto riesgo para el color
+    RISK_COLOR = COLOR_RISK_HIGH if is_high_risk else COLOR_RISK_LOW
+    RISK_TEXT = "ALTO RIESGO (RECHAZAR)" if is_high_risk else "BAJO RIESGO (APROBAR)"
+    
+    # --- CABECERA Y TÍTULO ---
+    pdf.set_font("Arial",'B',18)
+    pdf.set_text_color(*COLOR_HEADER)
+    pdf.cell(0, 10, "INFORME INTEGRADO DE RIESGO CREDITICIO", align=Align.C)
+    pdf.ln(5)
+    
+    pdf.set_font("Arial", '', 10)
+    pdf.cell(0, 5, f"Fecha de Análisis: {datetime.now().strftime('%d/%m/%Y')}", align=Align.R, ln=True)
+    pdf.ln(8)
+
+    # --- BLOQUE DE DECISIÓN DE RIESGO ---
+    pdf.set_fill_color(*RISK_COLOR)
+    pdf.set_text_color(255, 255, 255) # Texto Blanco
+    
+    pdf.set_font("Arial",'B', 16)
+    pdf.cell(0, 10, f" DECISIÓN AUTOMÁTICA: {RISK_TEXT}", 0, 0, align=Align.L, fill=True)
+    pdf.ln(12)
+    
+    pdf.set_text_color(*COLOR_HEADER) 
+
+    # --- 1. RESUMEN FINANCIERO Y CAPACIDAD DE PAGO ---
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 6, "1. Resumen Financiero y Capacidad de Pago", ln=True)
+    pdf.set_font("Arial", '', 10)
+    
+    # Cuadro de Resumen (usando Cell para simular columnas)
+    pdf.set_fill_color(*COLOR_BG)
+    pdf.cell(70, 5, "Monto Total Solicitado:", 0, 0, 'L', True)
+    pdf.cell(50, 5, f"${datos_usuario['LoanAmount']:,.2f}", 0, 0, 'L', True)
+    pdf.cell(40, 5, "PD Score:", 0, 0, 'L', True)
+    pdf.cell(0, 5, f"{prob*100:.2f}%", 0, 1, 'L', True) # PD Score
+    
+    pdf.cell(70, 5, "Plazo (Meses):", 0, 0, 'L', False)
+    pdf.cell(50, 5, plazo_total, 0, 0, 'L', False)
+    pdf.cell(40, 5, "Pago Mensual Fijo:", 0, 0, 'L', False)
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 5, f"${monthly_payment:,.2f}", 0, 1, 'L', False)
+    pdf.set_font("Arial", '', 10)
+
+    pdf.cell(70, 5, "Ingreso Mensual:", 0, 0, 'L', True)
+    pdf.cell(50, 5, f"${ingreso_mensual:,.2f}", 0, 0, 'L', True)
+    pdf.cell(40, 5, "% Ingreso Comprometido:", 0, 0, 'L', True)
+    
+    if pago_vs_ingreso > 100:
+        pdf.set_text_color(*COLOR_RISK_HIGH)
+        pdf.cell(0, 5, f"{pago_vs_ingreso:.2f}% (CRÍTICO: Pago > Ingreso)", 0, 1, 'L', True)
+        pdf.set_text_color(*COLOR_HEADER)
+    else:
+        pdf.cell(0, 5, f"{pago_vs_ingreso:.2f}%", 0, 1, 'L', True)
+    
+    pdf.ln(5)
+
+    # --- 2. JUSTIFICACIÓN Y FACTORES ---
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 6, "2. Justificación y Factores de Riesgo", ln=True)
+    pdf.set_font("Arial", '', 10)
+    pdf.ln(2)
+
+    # Tabla de Feature Importance
+    if not top_5_features.empty:
+        pdf.set_fill_color(220, 220, 220)
+        pdf.cell(50, 5, "FACTOR CLAVE", 1, 0, 'C', True)
+        pdf.cell(50, 5, "PESO RELATIVO", 1, 0, 'C', True)
+        pdf.cell(0, 5, "NOTA", 1, 1, 'C', True)
+        
+        pdf.set_fill_color(255, 255, 255)
+        for _, row in top_5_features.iterrows():
+            feature = row['Característica']
+            pdf.cell(50, 5, feature, 1, 0, 'L', True)
+            pdf.cell(50, 5, f"{row['Importancia']*100:.2f}%", 1, 0, 'L', True)
+            
+            # Nota interpretativa
+            if 'Age' in feature or 'StabilityScore' in feature:
+                pdf.cell(0, 5, "Estabilidad, antigüedad y experiencia del solicitante.", 1, 1, 'L', True)
+            elif 'InterestRate' in feature:
+                pdf.cell(0, 5, "La alta/baja tasa asignada es un fuerte predictor de riesgo inicial.", 1, 1, 'L', True)
+            elif 'Income' in feature:
+                pdf.cell(0, 5, "Capacidad de pago versus la carga de la deuda.", 1, 1, 'L', True)
+            else:
+                pdf.cell(0, 5, "", 1, 1, 'L', True)
+    else:
+        pdf.cell(0, 5, "Advertencia: La justificación no está disponible. Reentrene el modelo.", 0, 1, 'L', False)
+    
+    pdf.ln(5)
+
+    # --- 3. GRÁFICOS ---
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 6, "3. Visualización del Riesgo y Amortización", ln=True)
+    pdf.ln(2)
+    
+    # Integración de Gráficos (Guardar plots en buffer y luego insertar)
+    img_buffer_prob = BytesIO()
+    plot_prediction_bar(prob)
+    plt.savefig(img_buffer_prob, format='png')
+    plt.close()
+    img_buffer_prob.seek(0)
+    
+    img_buffer_amort = BytesIO()
+    plot_amortization(schedule, datos_usuario['LoanAmount'], datos_usuario['LoanTerm'])
+    plt.savefig(img_buffer_amort, format='png')
+    plt.close()
+    img_buffer_amort.seek(0)
+    
+    img_buffer_income = BytesIO()
+    plot_loan_income_percent(schedule, ingreso_mensual)
+    plt.savefig(img_buffer_income, format='png')
+    plt.close()
+    img_buffer_income.seek(0)
+    
+    # Colocar los gráficos en el PDF
+    pdf.image(img_buffer_prob, x=10, w=100)
+    pdf.ln(5)
+    pdf.image(img_buffer_amort, x=10, w=180)
+    pdf.ln(5)
+    pdf.image(img_buffer_income, x=10, w=100)
+
+    # Pie de página
+    pdf.set_y(-15)
+    pdf.set_font('Arial', 'I', 8)
+    pdf.cell(0, 10, 'Generado automáticamente por el Credit Risk Predictor V25.0', 0, 0, 'C')
+
+    # Guardar PDF
+    pdf_file = Path("Informe_Riesgo_Crediticio.pdf")
+    pdf.output(pdf_file)
+    
+    print(f"\n✅ Proceso completado. Informe PDF generado: {pdf_file}")
+
+
+def main():
+    print("\n=== INICIANDO ANALIZADOR DE RIESGO CREDITICIO V26.0 ===")
+    
+    # A) Cargar datos
+    try:
+        df = read_data(DATA_PATH)
+    except Exception as e:
+        print(e)
+        return
+        
+    # B) LÓGICA DE PRODUCCIÓN: Cargar o Entrenar
+    is_model_ready = MODEL_FILE.exists() and META_FILE.exists()
+
+    if not is_model_ready:
+        print("\n❌ Modelo no encontrado en disco. Se requiere entrenamiento inicial.")
+        pipe = train_pipeline(df)
+    else:
+        print(f"\n✔ Modelo ya existe. Cargando de: {MODEL_FILE.name}")
+        try:
+            pipe = joblib.load(MODEL_FILE)
+            print("✔ Carga exitosa. Listo para predecir.")
+        except Exception as e:
+            print(f"❌ ERROR CRÍTICO al cargar el modelo: {e}. Reentrenando.")
+            pipe = train_pipeline(df)
+
+
+    # C) Obtener datos del usuario
+    datos_usuario = ask_user_inputs()
+    
+    if datos_usuario:
+        # D) Predicción y Análisis
+        prob, pred, top_5_features = predict_single(datos_usuario, pipe)
+
+        # E) Cálculo Financiero
+        schedule = calculate_amortization(datos_usuario['LoanAmount'], datos_usuario['InterestRate'], datos_usuario['LoanTerm'])
+        riesgo = prob * 100
+        
+        # F) Generar PDF (Llamada al reporte profesional)
+        generar_pdf_detallado(datos_usuario, prob, riesgo, schedule, top_5_features)
+        
+        # G) Mensaje de Confirmación en Consola
+        es_default = "SÍ (ALTO riesgo)" if pred == 1 else "NO (BAJO riesgo)"
+        print("\n\n" + "="*50)
+        print("✅ PROCESO COMPLETADO")
+        print(f"Predicción: {es_default} (PD: {riesgo:.2f}%)")
+        print("=========================================")
+
+
+if __name__ == "__main__":
+    main()
